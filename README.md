@@ -3,7 +3,9 @@
 
 ## 概述
 
-已成功将 GCD（广义类别发现）模型从**图像处理**完全转换为**文本数据集**处理，遵循原始的三步流程架构。
+由于实验需要该模型作为baseline，已成功将最初GCD模型从**图像处理**完全转换为**文本数据集**处理，遵循原始的三步流程架构。
+
+S. Vaze, K. Hant, A. Vedaldi and A. Zisserman, "Generalized Category Discovery," 2022 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), New Orleans, LA, USA, 2022, pp. 7482-7491, doi: 10.1109/CVPR52688.2022.00734.
 
 ## 三步流程验证状态
 
@@ -81,7 +83,7 @@
    - 状态: 本地模型加载成功
 
 ## 数据集信息
-
+Abhijit Suresh, Jennifer Jacobs, Charis Harty, Margaret Perkoff, James H. Martin, and Tamara Sumner. 2022. The TalkMoves Dataset: K-12 Mathematics Lesson Transcripts Annotated for Teacher and Student Discursive Moves. In Proceedings of the Thirteenth Language Resources and Evaluation Conference, pages 4654–4662, Marseille, France. European Language Resources Association.
 ```
 TalkMoves 文本数据集
 ├── 训练集: 135,672 样本 (train.tsv)
@@ -124,7 +126,6 @@ bash bash_scripts/k_means.sh
 ## 输出位置
 
 ```
-/home/zhanglu/GCD/
 ├── osr_categories/
 │   ├── metric_learn_gcd/log/
 │   │   └── (DD.MM.YYYY_|_SS.mmm)/
