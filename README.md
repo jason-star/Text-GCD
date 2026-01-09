@@ -3,4 +3,5 @@ GCD was initially proposed by Sagar Vaze et al(S. Vaze, K. Hant, A. Vedaldi and 
 
 
 The results of the talkmoves dataset were reproduced.(Abhijit Suresh, Jennifer Jacobs, Charis Harty, Margaret Perkoff, James H. Martin, and Tamara Sumner. 2022. The TalkMoves Dataset: K-12 Mathematics Lesson Transcripts Annotated for Teacher and Student Discursive Moves. In Proceedings of the Thirteenth Language Resources and Evaluation Conference, pages 4654–4662, Marseille, France. European Language Resources Association.)
+
 <img width="660" height="122" alt="image" src="https://github.com/user-attachments/assets/4ed1c48d-7ee0-4e29-b05d-647a7fd69a2d" />
