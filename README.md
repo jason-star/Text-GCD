@@ -142,6 +142,9 @@ bash bash_scripts/k_means.sh
 └── talkmoves_pipeline_*.log
 ```
 
+## 实验结果
+
+<img width="671" height="147" alt="image" src="https://github.com/user-attachments/assets/3615d9ca-3ca9-43d7-9809-9eca91a4c737" />
 
 
 
