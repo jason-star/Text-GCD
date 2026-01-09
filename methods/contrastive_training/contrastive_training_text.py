@@ -1,0 +1,294 @@
+import torch
+import torch.nn as nn
+import argparse
+import os
+import numpy as np
+from torch.utils.data import DataLoader
+from sklearn.cluster import KMeans
+from torch.optim import SGD, lr_scheduler
+import warnings
+
+from models.text_transformer import TextTransformer
+from data.get_datasets import get_datasets, get_class_splits
+from data.data_utils import MergedDataset
+from project_utils.general_utils import init_experiment, get_mean_lr, str2bool
+from project_utils.cluster_and_log_utils import log_accs_from_preds
+from project_utils.cluster_utils import mixed_eval
+from config import exp_root
+from tqdm import tqdm
+from torch.nn import functional as F
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+class SupConLoss(nn.Module):
+    """
+    有监督对比学习损失函数
+    """
+    def __init__(self, temperature=0.07, contrast_mode='all', base_temperature=0.07):
+        super(SupConLoss, self).__init__()
+        self.temperature = temperature
+        self.contrast_mode = contrast_mode
+        self.base_temperature = base_temperature
+
+    def forward(self, features, labels=None, mask=None):
+        device = (torch.device('cuda') if features.is_cuda else torch.device('cpu'))
+        
+        if len(features.shape) < 3:
+            raise ValueError('`features` needs to be [bsz, n_views, ...],'
+                           'at least 3 dimensions are required')
+        if len(features.shape) > 3:
+            features = features.view(features.shape[0], features.shape[1], -1)
+
+        batch_size = features.shape[0]
+        if labels is not None and mask is not None:
+            raise ValueError('Cannot define both `labels` and `mask`')
+        elif labels is None and mask is None:
+            mask = torch.eye(batch_size, dtype=torch.float32).to(device)
+        elif labels is not None:
+            labels = labels.contiguous().view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
+            mask = torch.eq(labels, labels.T).float().to(device)
+        else:
+            mask = mask.float().to(device)
+
+        contrast_count = features.shape[1]
+        contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+        
+        if self.contrast_mode == 'one':
+            anchor_feature = features[:, 0]
+            anchor_count = 1
+        elif self.contrast_mode == 'all':
+            anchor_feature = contrast_feature
+            anchor_count = contrast_count
+        else:
+            raise ValueError('Unknown mode: {}'.format(self.contrast_mode))
+
+        # Tile mask
+        mask = mask.repeat(anchor_count, contrast_count)
+
+        # Compute similarity
+        anchor_dot_contrast = torch.div(
+            torch.matmul(anchor_feature, contrast_feature.T),
+            self.temperature)
+
+        # For numerical stability
+        logits_max, _ = torch.max(anchor_dot_contrast, dim=1, keepdim=True)
+        logits = anchor_dot_contrast - logits_max.detach()
+
+        # Mask out self-contrast cases
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(batch_size * anchor_count).view(-1, 1).to(device),
+            0
+        )
+        mask = mask * logits_mask
+
+        # Compute log probability
+        exp_logits = torch.exp(logits) * logits_mask
+        log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True))
+
+        # Extract positive logits
+        pos_log_prob = (mask * log_prob).sum(1) / mask.sum(1)
+        loss = -pos_log_prob.mean()
+        
+        # 检查并修复nan值
+        if torch.isnan(loss):
+            loss = torch.tensor(0.0, dtype=torch.float32, device=device, requires_grad=True)
+
+        return loss
+
+def collate_fn(batch):
+    """
+    自定义collate函数以处理文本数据
+    支持 3 值 (text, label, uq_idx) 或 4 值 (text, label, uq_idx, labeled_or_not)
+    """
+    if len(batch[0]) == 4:
+        texts, labels, uq_idxs, labeled_or_not = zip(*batch)
+        return list(texts), torch.tensor(labels), torch.tensor(uq_idxs), torch.tensor(labeled_or_not)
+    else:
+        texts, labels, uq_idxs = zip(*batch)
+        return list(texts), torch.tensor(labels), torch.tensor(uq_idxs)
+
+def encode_batch(model, texts, device):
+    """
+    编码一批文本
+    """
+    # 确保texts是list
+    if isinstance(texts, tuple):
+        texts = list(texts)
+    features = model.encode_texts(texts)
+    return features.to(device)
+
+def train(projection_head, model, train_loader, test_loader, unlabelled_train_loader, args):
+    """
+    训练函数
+    """
+    optimizer = SGD(list(projection_head.parameters()) + list(model.parameters()), 
+                   lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+
+    exp_lr_scheduler = lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, eta_min=args.lr * 1e-3,
+    )
+
+    sup_con_crit = SupConLoss()
+    best_test_acc_lab = 0
+
+    for epoch in range(args.epochs):
+        model.train()
+        projection_head.train()
+        
+        loss_record = 0
+        train_acc = 0
+
+        for batch_idx, (texts, labels, uq_idxs, labeled_or_not) in enumerate(tqdm(train_loader)):
+            device = torch.device('cuda:0')
+            labels = labels.to(device)
+            
+            # 编码文本
+            with torch.no_grad():
+                feats = encode_batch(model, texts, device)
+            
+            # 投影
+            proj_feats = projection_head(feats)
+            
+            # 计算损失
+            loss = sup_con_crit(proj_feats.unsqueeze(1), labels=labels)
+            
+            # 检查是否为nan或inf
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"警告: 损失异常! loss={loss}, proj_feats min={proj_feats.min()}, max={proj_feats.max()}")
+                loss = torch.tensor(0.0, requires_grad=True, device=device)
+            
+            loss_record += loss.item() if not (torch.isnan(loss) or torch.isinf(loss)) else 0
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        
+        exp_lr_scheduler.step()
+        
+        print(f'Epoch {epoch}: Loss={loss_record/len(train_loader):.4f}')
+        
+        # 评估
+        if (epoch + 1) % 5 == 0:
+            test_kmeans(model, test_loader, epoch, f'talkmoves_{epoch}', args)
+        
+        # 保存最新模型
+        save_path = os.path.join(args.log_dir, f'model_epoch_{epoch}.pt')
+        torch.save(model.state_dict(), save_path)
+        
+        # 保存最佳模型（基于last epoch作为best）
+        if epoch == args.epochs - 1:
+            best_model_path = os.path.join(args.log_dir, 'model_best.pt')
+            torch.save(model.state_dict(), best_model_path)
+            print(f'✅ 最佳模型已保存到: {best_model_path}')
+
+def test_kmeans(model, test_loader, epoch, save_name, args):
+    """
+    使用K-means进行聚类评估
+    """
+    model.eval()
+
+    all_feats = []
+    targets = []
+
+    print('Collating features...')
+    for batch_idx, batch in enumerate(tqdm(test_loader)):
+        if len(batch) == 3:
+            texts, label, _ = batch
+        else:
+            texts, label, _, _ = batch
+            
+        with torch.no_grad():
+            device = torch.device('cuda:0')
+            feats = encode_batch(model, texts, device)
+        
+        all_feats.append(feats.cpu().numpy())
+        targets.extend(label.cpu().numpy().tolist())
+
+    # K-MEANS
+    print('Fitting K-Means...')
+    all_feats = np.concatenate(all_feats)
+    kmeans = KMeans(n_clusters=args.num_labeled_classes + args.num_unlabeled_classes, 
+                   random_state=0).fit(all_feats)
+    preds = kmeans.labels_
+    print('Done!')
+
+    # CREATE MASK FOR EVALUATION (区分已知类别和未知类别)
+    targets = np.array(targets)
+    mask = targets < args.num_labeled_classes
+
+    # EVALUATE
+    all_acc, old_acc, new_acc = log_accs_from_preds(y_true=targets, y_pred=preds, mask=mask,
+                                                    T=epoch, eval_funcs=args.eval_funcs, 
+                                                    save_name=save_name, writer=args.writer)
+
+def main():
+    parser = argparse.ArgumentParser(description='cluster')
+    parser.add_argument('--batch_size', default=32, type=int)
+    parser.add_argument('--num_workers', default=0, type=int)
+    parser.add_argument('--eval_funcs', nargs='+', help='Which eval functions to use', 
+                       default=['v1', 'v2'])
+    
+    parser.add_argument('--model_name', type=str, default='bert-base-uncased')
+    parser.add_argument('--local_model_path', type=str, default='/home/zhanglu/bert/bert-base-uncased',
+                        help='Local path to BERT model')
+    parser.add_argument('--dataset_name', type=str, default='talkmoves')
+    parser.add_argument('--prop_train_labels', type=float, default=0.8)
+    
+    parser.add_argument('--lr', type=float, default=0.1)
+    parser.add_argument('--momentum', type=float, default=0.9)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--epochs', default=20, type=int)
+    parser.add_argument('--exp_root', type=str, default=exp_root)
+    parser.add_argument('--seed', default=1, type=int)
+    
+    parser.add_argument('--temperature', type=float, default=1.0)
+    parser.add_argument('--sup_con_weight', type=float, default=0.5)
+    parser.add_argument('--n_views', default=2, type=int)
+
+    args = parser.parse_args()
+    device = torch.device('cuda:0')
+    args = get_class_splits(args)
+
+    args.num_labeled_classes = len(args.train_classes)
+    args.num_unlabeled_classes = len(args.unlabeled_classes)
+
+    init_experiment(args, runner_name=['metric_learn_gcd'])
+    print(f'Using evaluation function {args.eval_funcs[0]} to print results')
+
+    # BASE MODEL
+    print(f'Using model: {args.model_name}')
+    model = TextTransformer(model_name=args.model_name, output_dim=768, pretrained=True, local_model_path=args.local_model_path)
+    model = model.to(device)
+
+    # PROJECTION HEAD
+    projection_head = nn.Sequential(
+        nn.Linear(768, 768),
+        nn.ReLU(inplace=True),
+        nn.Linear(768, 128)
+    )
+    projection_head = projection_head.to(device)
+
+    # DATA LOADING
+    train_dataset, test_dataset, unlabelled_train_examples_test, datasets = get_datasets(
+        args.dataset_name, train_transform=None, test_transform=None, args=args)
+
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, 
+                             shuffle=True, num_workers=args.num_workers, 
+                             collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, 
+                            shuffle=False, num_workers=args.num_workers,
+                            collate_fn=collate_fn)
+    unlabelled_train_loader = DataLoader(unlabelled_train_examples_test, 
+                                        batch_size=args.batch_size, shuffle=True, 
+                                        num_workers=args.num_workers,
+                                        collate_fn=collate_fn)
+
+    # TRAINING
+    train(projection_head, model, train_loader, test_loader, unlabelled_train_loader, args)
+
+if __name__ == '__main__':
+    main()
